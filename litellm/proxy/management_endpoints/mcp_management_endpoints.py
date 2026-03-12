@@ -1051,6 +1051,7 @@ if MCP_AVAILABLE:
         response_model=LiteLLM_MCPServerTable,
     )
     async def fetch_mcp_server(
+        request: Request,
         server_id: str,
         user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
     ):
@@ -1067,8 +1068,30 @@ if MCP_AVAILABLE:
             "Database not connected. Connect a database to your proxy"
         )
 
-        # check to see if server exists for all users
+        # check to see if server exists (DB first, then registry for config-based servers)
         mcp_server = await get_mcp_server(prisma_client, server_id)
+        from_db = mcp_server is not None
+
+        if mcp_server is None:
+            # Fallback: check registry (config-based servers) - list endpoint uses get_registry()
+            from litellm.proxy.auth.ip_address_utils import IPAddressUtils
+
+            client_ip = IPAddressUtils.get_mcp_client_ip(request)
+            registry_server = global_mcp_server_manager.get_mcp_server_by_id(server_id)
+            if registry_server is not None and not global_mcp_server_manager._is_server_accessible_from_ip(
+                registry_server, client_ip
+            ):
+                registry_server = None
+            if registry_server is None:
+                # Try lookup by server_name or alias (client may use display name in URL)
+                registry_server = global_mcp_server_manager.get_mcp_server_by_name(
+                    server_id, client_ip=client_ip
+                )
+            if registry_server is not None:
+                mcp_server = global_mcp_server_manager._build_mcp_server_table(
+                    registry_server
+                )
+
         if mcp_server is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1084,10 +1107,17 @@ if MCP_AVAILABLE:
         if not is_admin_view:
             # Perform authz check BEFORE any health check (avoid side-effects for
             # unauthorized callers).
-            mcp_server_records = await get_all_mcp_servers_for_user(
-                prisma_client, user_api_key_dict
-            )
-            exists = does_mcp_server_exist(mcp_server_records, server_id)
+            if from_db:
+                mcp_server_records = await get_all_mcp_servers_for_user(
+                    prisma_client, user_api_key_dict
+                )
+                exists = does_mcp_server_exist(mcp_server_records, server_id)
+            else:
+                # Registry/config server: use same access logic as list endpoint
+                allowed_server_ids = await global_mcp_server_manager.get_allowed_mcp_servers(
+                    user_api_key_dict
+                )
+                exists = mcp_server.server_id in allowed_server_ids
 
             if not exists:
                 raise HTTPException(
@@ -1101,7 +1131,8 @@ if MCP_AVAILABLE:
                 )
 
         # At this point caller is authorized to view the server.
-        await global_mcp_server_manager.add_server(mcp_server)
+        if from_db:
+            await global_mcp_server_manager.add_server(mcp_server)
 
         # Perform health check on the server using server manager
         try:
@@ -1276,9 +1307,20 @@ if MCP_AVAILABLE:
     def _get_cached_temporary_mcp_server_or_404(server_id: str) -> MCPServer:
         server = get_cached_temporary_mcp_server(server_id)
         if server is None:
+            # Fall back to real DB/config server (e.g. for the user-side OAuth flow
+            # which calls these endpoints with a real server_id, not a temp session id).
+            from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+                global_mcp_server_manager,
+            )
+
+            server = (
+                global_mcp_server_manager.get_mcp_server_by_id(server_id)
+                or global_mcp_server_manager.get_mcp_server_by_name(server_id)
+            )
+        if server is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail={"error": f"Temporary MCP server {server_id} not found"},
+                detail={"error": f"MCP server {server_id} not found"},
             )
         return server
 
@@ -1289,8 +1331,8 @@ if MCP_AVAILABLE:
     async def mcp_authorize(
         request: Request,
         server_id: str,
-        client_id: str,
-        redirect_uri: str,
+        client_id: Optional[str] = None,
+        redirect_uri: str = Query(...),
         state: str = "",
         code_challenge: Optional[str] = None,
         code_challenge_method: Optional[str] = None,
@@ -1298,10 +1340,23 @@ if MCP_AVAILABLE:
         scope: Optional[str] = None,
     ):
         mcp_server = _get_cached_temporary_mcp_server_or_404(server_id)
+        # Use the server's stored client_id when the caller doesn't supply one
+        resolved_client_id = mcp_server.client_id or client_id or ""
+        if not resolved_client_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "missing_client_id",
+                    "message": (
+                        "No client_id available for this MCP server. "
+                        "Either configure the server with a client_id or supply one in the request."
+                    ),
+                },
+            )
         return await authorize_with_server(
             request=request,
             mcp_server=mcp_server,
-            client_id=client_id,
+            client_id=resolved_client_id,
             redirect_uri=redirect_uri,
             state=state,
             code_challenge=code_challenge,
@@ -1320,18 +1375,30 @@ if MCP_AVAILABLE:
         grant_type: str = Form(...),
         code: Optional[str] = Form(None),
         redirect_uri: Optional[str] = Form(None),
-        client_id: str = Form(...),
+        client_id: Optional[str] = Form(None),
         client_secret: Optional[str] = Form(None),
         code_verifier: Optional[str] = Form(None),
     ):
         mcp_server = _get_cached_temporary_mcp_server_or_404(server_id)
+        resolved_client_id = mcp_server.client_id or client_id or ""
+        if not resolved_client_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "missing_client_id",
+                    "message": (
+                        "No client_id available for this MCP server. "
+                        "Either configure the server with a client_id or supply one in the request."
+                    ),
+                },
+            )
         return await exchange_token_with_server(
             request=request,
             mcp_server=mcp_server,
             grant_type=grant_type,
             code=code,
             redirect_uri=redirect_uri,
-            client_id=client_id,
+            client_id=resolved_client_id,
             client_secret=client_secret,
             code_verifier=code_verifier,
         )
@@ -1658,12 +1725,6 @@ if MCP_AVAILABLE:
             sid = cred["server_id"]
             srv = servers.get(sid)
             expires_at: Optional[str] = cred.get("expires_at")
-            is_expired = False
-            if expires_at:
-                try:
-                    is_expired = datetime.fromisoformat(expires_at) < datetime.now(timezone.utc)
-                except Exception:
-                    pass
             items.append(
                 MCPUserCredentialListItem(
                     server_id=sid,
